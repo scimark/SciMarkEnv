@@ -61,6 +61,28 @@ services:
       - postgres
     restart: unless-stopped
 
+  # MCP-сервер для Jira/Confluence (Server/DC), только чтение.
+  # Claude Code подключается к нему по URL: http://localhost:9000/mcp
+  mcp-atlassian:
+    image: ghcr.io/sooperset/mcp-atlassian:latest
+    container_name: mcp-atlassian
+    command: ["--transport", "streamable-http", "--host", "0.0.0.0", "--port", "9000"]
+    environment:
+      JIRA_URL: https://jira.predictor.su
+      JIRA_PERSONAL_TOKEN: ${JIRA_PERSONAL_TOKEN}
+      CONFLUENCE_URL: https://confluence.predictor.su
+      CONFLUENCE_PERSONAL_TOKEN: ${CONFLUENCE_PERSONAL_TOKEN}
+      READ_ONLY_MODE: "true"
+      JIRA_SSL_VERIFY: "false"
+      CONFLUENCE_SSL_VERIFY: "false"
+    ports:
+      - "9000:9000"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    restart: unless-stopped
+
 volumes:
   postgres-data:
   rabbitmq-data:
