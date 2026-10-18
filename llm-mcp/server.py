@@ -1,6 +1,10 @@
 """MCP-сервер: делегирование задач командному LLM через OpenAI-совместимый API."""
+import asyncio
 import glob
 import os
+import time
+import uuid
+from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
 
 import httpx
@@ -21,8 +25,16 @@ HOST_PREFIX = PureWindowsPath(os.environ.get("WORKSPACE_HOST_PREFIX", r"C:\Scima
 MAX_INPUT_CHARS = int(os.environ.get("LLM_MAX_INPUT_CHARS", "800000"))
 MAX_FILES = int(os.environ.get("LLM_MAX_FILES", "200"))
 
-mcp = FastMCP("llm", host="0.0.0.0", port=int(os.environ.get("MCP_PORT", "8765")))
+# Асинхронные задачи: для клиентов с коротким таймаутом на вызов тула.
+JOB_TTL = int(os.environ.get("LLM_JOB_TTL", "3600"))          # сек, сколько хранить готовые
+MAX_PARALLEL = int(os.environ.get("LLM_MAX_PARALLEL", "4"))   # одновременных запросов к LLM
+MAX_WAIT = 50                                                 # сек, меньше таймаута клиента (60)
 
+mcp = FastMCP("llm", host="0.0.0.0", port=int(os.environ.get("MCP_PORT", "8765")))
+_llm_slots = asyncio.Semaphore(MAX_PARALLEL)
+
+
+# ---------- LLM ----------
 
 def _client() -> httpx.AsyncClient:
     if not BASE_URL or not API_KEY:
@@ -43,11 +55,13 @@ async def _chat(messages: list[dict]) -> str:
         "reasoning_effort": REASONING_EFFORT,
         "include_reasoning": False,
     }
-    async with _client() as client:
+    async with _llm_slots, _client() as client:
         resp = await client.post("/chat/completions", json=payload)
         resp.raise_for_status()
     return (resp.json()["choices"][0]["message"]["content"] or "").strip()
 
+
+# ---------- Файлы ----------
 
 def _to_container(path: str) -> str:
     """C:\\Scimark\\x\\*.log -> /workspace/x/*.log. Пути внутри /workspace оставляем как есть."""
@@ -81,7 +95,7 @@ def _host_path(p: Path) -> str:
 
 
 def _read_files(files: list[Path]) -> tuple[str, int, list[str]]:
-    """Склеивает файлы в один блок в пределах лимита. Возвращает текст и заметки о пропусках."""
+    """Склеивает файлы в один блок в пределах лимита. Возвращает текст, число файлов и заметки."""
     parts, notes, budget = [], [], MAX_INPUT_CHARS
     for p in files:
         raw = p.read_bytes()
@@ -101,29 +115,87 @@ def _read_files(files: list[Path]) -> tuple[str, int, list[str]]:
     return "\n\n".join(parts), len(parts), notes
 
 
-@mcp.tool()
-async def summarize_files(paths: list[str], question: str) -> str:
-    """Командный LLM сам читает файлы с диска пользователя и отвечает на вопрос по ним.
+# ---------- Сценарии (общие для sync и async тулов) ----------
 
-    paths - пути или глобы в C:\\Scimark (например C:\\Scimark\\logs\\**\\*.log).
-    Файлы не проходят через контекст вызывающего - возвращается только ответ.
-    Используй для больших логов, исходников, конфигов, когда нужна выжимка, а не весь текст.
-    """
+def _ask_messages(prompt: str, system: str | None) -> list[dict]:
+    messages = [{"role": "system", "content": system}] if system else []
+    messages.append({"role": "user", "content": prompt})
+    return messages
+
+
+def _prepare_summarize(paths: list[str], question: str) -> tuple[list[dict], str]:
+    """Читает файлы сразу: ошибки путей видны при вызове, а не потом в задаче."""
     files = _resolve_files(paths)
     content, read_count, notes = _read_files(files)
     system = (
         "Ты анализируешь файлы и отвечаешь на вопрос по ним. Отвечай кратко и по делу, "
         "ссылайся на файл и строку/фрагмент, если это важно. Не выдумывай того, чего нет в файлах."
     )
-    answer = await _chat([
+    messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": f"{content}\n\nВопрос: {question}"},
-    ])
+    ]
     footer = f"\n\n---\nфайлов прочитано: {read_count} из {len(files)}"
     if notes:
         footer += "\n" + "\n".join(notes)
-    return answer + footer
+    return messages, footer
 
+
+# ---------- Задачи ----------
+
+@dataclass
+class Job:
+    kind: str
+    created: float = field(default_factory=time.time)
+    finished: float | None = None
+    result: str | None = None
+    error: str | None = None
+    task: asyncio.Task | None = None
+
+    @property
+    def status(self) -> str:
+        if self.error is not None:
+            return "error"
+        return "done" if self.finished else "running"
+
+    def view(self, job_id: str) -> dict:
+        elapsed = (self.finished or time.time()) - self.created
+        out = {"job_id": job_id, "kind": self.kind, "status": self.status, "elapsed_s": int(elapsed)}
+        if self.result is not None:
+            out["result"] = self.result
+        if self.error is not None:
+            out["error"] = self.error
+        return out
+
+
+_jobs: dict[str, Job] = {}
+
+
+def _gc_jobs() -> None:
+    now = time.time()
+    for job_id in [j for j, job in _jobs.items() if job.finished and now - job.finished > JOB_TTL]:
+        del _jobs[job_id]
+
+
+def _submit(kind: str, messages: list[dict], footer: str = "") -> dict:
+    _gc_jobs()
+    job_id = uuid.uuid4().hex[:12]
+    job = Job(kind=kind)
+
+    async def run() -> None:
+        try:
+            job.result = await _chat(messages) + footer
+        except Exception as e:  # отдаём ошибку клиенту через job_result
+            job.error = f"{type(e).__name__}: {e}"
+        finally:
+            job.finished = time.time()
+
+    job.task = asyncio.create_task(run())
+    _jobs[job_id] = job
+    return {"job_id": job_id, "status": "running", "hint": "забери ответ через job_result(job_id)"}
+
+
+# ---------- Тулы ----------
 
 @mcp.tool()
 async def llm_health() -> dict:
@@ -141,19 +213,73 @@ async def llm_health() -> dict:
         "thinking": THINKING,
         "reasoning_effort": REASONING_EFFORT,
         "models": models,
+        "jobs_running": sum(1 for j in _jobs.values() if j.status == "running"),
     }
 
 
 @mcp.tool()
 async def ask(prompt: str, system: str | None = None) -> str:
-    """Отдать задачу командному LLM (Qwen) и получить только итоговый ответ.
+    """Отдать задачу командному LLM (Qwen) и дождаться итогового ответа.
 
     Подходит для шаблонного кода, маппингов, DTO, тест-кейсов, выжимок.
     Ответ модели нужно проверять: это 27B-модель, а не замена ревью.
+    Думает долго (до минут). Если у клиента таймаут на тул ~60 с - используй ask_async.
     """
-    messages = [{"role": "system", "content": system}] if system else []
-    messages.append({"role": "user", "content": prompt})
-    return await _chat(messages)
+    return await _chat(_ask_messages(prompt, system))
+
+
+@mcp.tool()
+async def summarize_files(paths: list[str], question: str) -> str:
+    """Командный LLM сам читает файлы с диска пользователя и отвечает на вопрос по ним.
+
+    paths - пути или глобы в C:\\Scimark (например C:\\Scimark\\logs\\**\\*.log).
+    Файлы не проходят через контекст вызывающего - возвращается только ответ.
+    Думает долго. Если у клиента таймаут на тул ~60 с - используй summarize_files_async.
+    """
+    messages, footer = _prepare_summarize(paths, question)
+    return await _chat(messages) + footer
+
+
+@mcp.tool()
+async def ask_async(prompt: str, system: str | None = None) -> dict:
+    """То же, что ask, но сразу возвращает job_id. Ответ забирать через job_result."""
+    return _submit("ask", _ask_messages(prompt, system))
+
+
+@mcp.tool()
+async def summarize_files_async(paths: list[str], question: str) -> dict:
+    """То же, что summarize_files, но сразу возвращает job_id. Ответ забирать через job_result.
+
+    Ошибки путей (нет файлов, путь вне C:\\Scimark) возвращаются сразу.
+    """
+    messages, footer = _prepare_summarize(paths, question)
+    return _submit("summarize_files", messages, footer)
+
+
+@mcp.tool()
+async def job_result(job_id: str, wait_seconds: int = 45) -> dict:
+    """Статус и ответ асинхронной задачи.
+
+    Ждёт готовности до wait_seconds (максимум 50), потом отдаёт текущий статус.
+    status: running - вызови ещё раз; done - ответ в result; error - текст в error.
+    """
+    job = _jobs.get(job_id)
+    if job is None:
+        return {"job_id": job_id, "status": "not_found", "error": "нет такой задачи или она устарела"}
+    if job.task and not job.task.done():
+        wait = max(0, min(wait_seconds, MAX_WAIT))
+        await asyncio.wait({job.task}, timeout=wait)
+    return job.view(job_id)
+
+
+@mcp.tool()
+async def list_jobs() -> list[dict]:
+    """Список задач (без текстов ответов): id, тип, статус, сколько секунд идёт."""
+    _gc_jobs()
+    return [
+        {k: v for k, v in job.view(job_id).items() if k not in ("result", "error")}
+        for job_id, job in _jobs.items()
+    ]
 
 
 if __name__ == "__main__":

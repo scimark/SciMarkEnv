@@ -25,3 +25,10 @@
 Свой MCP-сервер (`llm-mcp/`), через который Claude делегирует простые задачи командному LLM.
 Папка `WORKSPACE_DIR` смонтирована в контейнер только на чтение.
 После правок кода: `docker compose up -d --build mcp-llm`.
+
+Тулы:
+- `ask`, `summarize_files` - синхронно, ждут ответ (Claude Code);
+- `ask_async`, `summarize_files_async` + `job_result`, `list_jobs` - для клиентов с таймаутом ~60 с на вызов. Задачи живут в памяти, рестарт контейнера их теряет;
+- `llm_health` - модели, контекст, текущие настройки.
+
+Проверка: `docker exec mcp-llm python /workspace/SciMarkEnv/llm-mcp/smoke_test.py`.
