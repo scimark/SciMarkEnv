@@ -1,6 +1,7 @@
 """MCP-сервер: делегирование задач командному LLM через OpenAI-совместимый API."""
 import asyncio
 import glob
+import json
 import os
 import time
 import uuid
@@ -29,8 +30,8 @@ MAX_FILES = int(os.environ.get("LLM_MAX_FILES", "200"))
 
 # Асинхронные задачи: для клиентов с коротким таймаутом на вызов тула.
 JOB_TTL = int(os.environ.get("LLM_JOB_TTL", "3600"))          # сек, сколько хранить готовые
-MAX_PARALLEL = int(os.environ.get("LLM_MAX_PARALLEL", "4"))   # одновременных запросов к LLM
-MAX_WAIT = 50                                                 # сек, меньше таймаута клиента (60)
+MAX_PARALLEL = int(os.environ.get("LLM_MAX_PARALLEL", "16"))  # одновременных запросов к LLM (vLLM батчит)
+MAX_WAIT = 40                                                 # сек, с запасом до таймаута клиента (60)
 
 # stateless_http: без серверных сессий - клиенты переживают рестарт контейнера.
 mcp = FastMCP("llm", host="0.0.0.0", port=int(os.environ.get("MCP_PORT", "8765")), stateless_http=True)
@@ -49,19 +50,45 @@ def _client() -> httpx.AsyncClient:
     )
 
 
-async def _chat(messages: list[dict]) -> str:
-    """Один запрос к модели. Рассуждения не возвращаем - только итоговый ответ."""
+EFFORTS = ("low", "medium", "xhigh")
+CODE_EFFORT = os.environ.get("LLM_CODE_EFFORT", "medium")  # xhigh на коде думает по 10+ минут
+
+
+async def _chat(messages: list[dict], effort: str | None = None) -> str:
+    """Один запрос к модели, стримингом.
+
+    Шлюз llm.predictor.su рвёт непотоковые запросы на ~90 с (504), а xhigh думает дольше.
+    Поток держит соединение живым; рассуждения тоже идут в поток, но здесь отбрасываются -
+    наружу уходит только итоговый ответ.
+    """
+    effort = effort or REASONING_EFFORT
+    if effort not in EFFORTS:
+        raise ValueError(f"effort должен быть одним из {EFFORTS}")
     payload = {
         "model": MODEL or None,
         "messages": messages,
         "thinking": THINKING,
-        "reasoning_effort": REASONING_EFFORT,
-        "include_reasoning": False,
+        "reasoning_effort": effort,
+        "include_reasoning": True,   # чтобы байты шли и во время рассуждений
+        "stream": True,
     }
+    parts: list[str] = []
     async with _llm_slots, _client() as client:
-        resp = await client.post("/chat/completions", json=payload)
-        resp.raise_for_status()
-    return (resp.json()["choices"][0]["message"]["content"] or "").strip()
+        async with client.stream("POST", "/chat/completions", json=payload) as resp:
+            if resp.status_code >= 400:
+                await resp.aread()
+                resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                for choice in json.loads(data).get("choices") or []:
+                    piece = (choice.get("delta") or {}).get("content")
+                    if piece:
+                        parts.append(piece)
+    return "".join(parts).strip()
 
 
 # ---------- Файлы ----------
@@ -180,14 +207,14 @@ def _gc_jobs() -> None:
         del _jobs[job_id]
 
 
-def _submit(kind: str, messages: list[dict], footer: str = "") -> dict:
+def _submit(kind: str, messages: list[dict], footer: str = "", effort: str | None = None) -> dict:
     _gc_jobs()
     job_id = uuid.uuid4().hex[:12]
     job = Job(kind=kind)
 
     async def run() -> None:
         try:
-            job.result = await _chat(messages) + footer
+            job.result = await _chat(messages, effort) + footer
         except Exception as e:  # отдаём ошибку клиенту через job_result
             job.error = f"{type(e).__name__}: {e}"
         finally:
@@ -221,14 +248,15 @@ async def llm_health() -> dict:
 
 
 @mcp.tool()
-async def ask(prompt: str, system: str | None = None) -> str:
+async def ask(prompt: str, system: str | None = None, effort: str | None = None) -> str:
     """Отдать задачу командному LLM (Qwen) и дождаться итогового ответа.
 
     Подходит для шаблонного кода, маппингов, DTO, тест-кейсов, выжимок.
     Ответ модели нужно проверять: это 27B-модель, а не замена ревью.
     Думает долго (до минут). Если у клиента таймаут на тул ~60 с - используй ask_async.
+    effort - low | medium | xhigh (по умолчанию xhigh).
     """
-    return await _chat(_ask_messages(prompt, system))
+    return await _chat(_ask_messages(prompt, system), effort)
 
 
 @mcp.tool()
@@ -244,9 +272,9 @@ async def summarize_files(paths: list[str], question: str) -> str:
 
 
 @mcp.tool()
-async def ask_async(prompt: str, system: str | None = None) -> dict:
+async def ask_async(prompt: str, system: str | None = None, effort: str | None = None) -> dict:
     """То же, что ask, но сразу возвращает job_id. Ответ забирать через job_result."""
-    return _submit("ask", _ask_messages(prompt, system))
+    return _submit("ask", _ask_messages(prompt, system), effort=effort)
 
 
 @mcp.tool()
@@ -260,10 +288,10 @@ async def summarize_files_async(paths: list[str], question: str) -> dict:
 
 
 @mcp.tool()
-async def job_result(job_id: str, wait_seconds: int = 45) -> dict:
+async def job_result(job_id: str, wait_seconds: int = 35) -> dict:
     """Статус и ответ асинхронной задачи.
 
-    Ждёт готовности до wait_seconds (максимум 50), потом отдаёт текущий статус.
+    Ждёт готовности до wait_seconds (максимум 40), потом отдаёт текущий статус.
     status: running - вызови ещё раз; done - ответ в result; error - текст в error.
     """
     job = _jobs.get(job_id)
@@ -283,6 +311,44 @@ async def list_jobs() -> list[dict]:
         {k: v for k, v in job.view(job_id).items() if k not in ("result", "error")}
         for job_id, job in _jobs.items()
     ]
+
+
+# ---------- Код: квен пишет по ТЗ, вызывающий ревьюит ----------
+
+CODE_SYSTEM = (
+    "Ты senior-разработчик. Пиши рабочий, чистый код строго по ТЗ, в стиле переданных файлов проекта. "
+    "Ничего не выдумывай за пределами ТЗ; если чего-то не хватает - перечисли в конце в 'Вопросы'.\n"
+    "Формат ответа - только файлы и короткие заметки:\n"
+    "=== FILE: <путь> ===\n```<язык>\n<полное содержимое файла>\n```\n"
+    "...повторить для каждого файла...\n"
+    "=== NOTES ===\n<до 5 строк: что сделано, допущения, вопросы>"
+)
+
+
+@mcp.tool()
+async def write_code(task: str, context_paths: list[str] | None = None, background: bool = False,
+                     effort: str | None = None):
+    """Квен пишет код по ТЗ. Сам читает файлы проекта из context_paths (образцы стиля, интерфейсы,
+    файл, который надо переделать) - их содержимое не проходит через контекст вызывающего.
+
+    Возвращает файлы целиком в формате '=== FILE: путь ===' + заметки. Код ОБЯЗАТЕЛЬНО ревьюить.
+    Годится для шаблонного кода: DTO, мапперы, CRUD, тесты, миграции, рефакторинг по образцу.
+    background=true - сразу вернуть job_id, ответ забрать через job_result.
+    effort - low | medium | xhigh, по умолчанию medium (xhigh на коде думает по 10+ минут).
+    """
+    effort = effort or CODE_EFFORT
+    content, footer = "", ""
+    if context_paths:
+        files = _resolve_files(context_paths)
+        content, read_count, notes = _read_files(files)
+        footer = f"\n\n---\nконтекст: {read_count} из {len(files)} файлов" + "".join(f"\n{n}" for n in notes)
+    messages = [
+        {"role": "system", "content": CODE_SYSTEM},
+        {"role": "user", "content": f"{content}\n\nТЗ:\n{task}" if content else f"ТЗ:\n{task}"},
+    ]
+    if background:
+        return _submit("write_code", messages, footer, effort)
+    return await _chat(messages, effort) + footer
 
 
 # ---------- Jira / Confluence: квен сам читает, наружу только суть ----------
