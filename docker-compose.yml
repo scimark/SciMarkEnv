@@ -1,3 +1,7 @@
+# Локальное окружение SciMark: БД, брокер, pgadmin и MCP-серверы для Claude.
+# Все адреса и секреты - только в .env (шаблон: .env.example).
+name: scimark-env
+
 services:
   postgres:
     image: postgres
@@ -62,6 +66,8 @@ services:
       - postgres
     restart: unless-stopped
 
+  # Jira/Confluence (Server/DC), только чтение.
+  # Claude Code: claude mcp add --transport http atlassian http://localhost:9000/mcp --scope user
   mcp-atlassian:
     image: ghcr.io/sooperset/mcp-atlassian:latest
     container_name: mcp-atlassian
@@ -71,20 +77,83 @@ services:
       JIRA_PERSONAL_TOKEN: ${JIRA_PERSONAL_TOKEN:?JIRA_PERSONAL_TOKEN не задан в .env}
       CONFLUENCE_URL: ${CONFLUENCE_URL:?CONFLUENCE_URL не задан в .env}
       CONFLUENCE_PERSONAL_TOKEN: ${CONFLUENCE_PERSONAL_TOKEN:?CONFLUENCE_PERSONAL_TOKEN не задан в .env}
-      READ_ONLY_MODE: "true"
-      TOOLSETS: "all"
+      READ_ONLY_MODE: ${ATLASSIAN_READ_ONLY:-true}
+      TOOLSETS: ${ATLASSIAN_TOOLSETS:-all}
       ALLOW_GLOBAL_CRED_FALLBACK: "true"
-      JIRA_SSL_VERIFY: "false"
-      CONFLUENCE_SSL_VERIFY: "false"
+      JIRA_SSL_VERIFY: ${ATLASSIAN_SSL_VERIFY:-false}
+      CONFLUENCE_SSL_VERIFY: ${ATLASSIAN_SSL_VERIFY:-false}
     ports:
-      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9000:9000"              # только localhost
     deploy:
       resources:
         limits:
           memory: 256M
     restart: unless-stopped
 
+  # Jenkins через REST API.
+  # Claude Code: claude mcp add --transport http jenkins http://localhost:9887/mcp --scope user
+  mcp-jenkins:
+    image: ghcr.io/lanbaoshen/mcp-jenkins:latest
+    container_name: mcp-jenkins
+    command: ["--transport", "streamable-http", "--host", "0.0.0.0", "--port", "9887"]
+    environment:
+      JENKINS_URL: ${JENKINS_URL:?JENKINS_URL не задан в .env}
+      JENKINS_USERNAME: ${JENKINS_USERNAME:?JENKINS_USERNAME не задан в .env}
+      JENKINS_PASSWORD: ${JENKINS_PASSWORD:?JENKINS_PASSWORD не задан в .env}
+      JENKINS_TIMEOUT: ${JENKINS_TIMEOUT:-30}
+    ports:
+      - "127.0.0.1:9887:9887"              # только localhost
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    restart: unless-stopped
+
+  # GitHub, только чтение. Токен передаёт клиент в заголовке, в .env не нужен.
+  # Claude Code: claude mcp add --transport http github http://localhost:8082 --scope user ^
+  #   --header "Authorization: Bearer <classic PAT>" --header "X-MCP-Readonly: true"
+  mcp-github:
+    image: ghcr.io/github/github-mcp-server:latest
+    container_name: mcp-github
+    command: ["http", "--port", "8082", "--read-only", "--toolsets", "context,repos,pull_requests"]
+    ports:
+      - "127.0.0.1:8082:8082"              # только localhost
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+    restart: unless-stopped
+
+  # Делегирование задач командному LLM. Рабочая папка смонтирована только на чтение.
+  # Claude Code: claude mcp add --transport http llm http://localhost:8765/mcp --scope user
+  mcp-llm:
+    build: ./llm-mcp
+    image: scimark/mcp-llm:local
+    container_name: mcp-llm
+    environment:
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+    volumes:
+      - ${WORKSPACE_DIR:-/mnt/c/Scimark}:/workspace:ro
+    ports:
+      - "127.0.0.1:8765:8765"              # только localhost
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    restart: unless-stopped
+
+# Тома со старыми данными (созданы ещё стеком из C:\Scimark\env).
+# external: compose их не создаёт и не удаляет даже при `down -v`.
+# На чистой машине один раз: docker volume create env_postgres-data (и остальные).
 volumes:
   postgres-data:
+    name: env_postgres-data
+    external: true
   rabbitmq-data:
+    name: env_rabbitmq-data
+    external: true
   pgadmin-data:
+    name: env_pgadmin-data
+    external: true
