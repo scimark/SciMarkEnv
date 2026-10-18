@@ -137,6 +137,7 @@ services:
       LLM_THINKING: ${LLM_THINKING:-true}
       LLM_REASONING_EFFORT: ${LLM_REASONING_EFFORT:-xhigh}
       LLM_TIMEOUT: ${LLM_TIMEOUT:-900}
+      WORKSPACE_HOST_PREFIX: ${WORKSPACE_HOST_PREFIX:-C:\Scimark}
     volumes:
       - ${WORKSPACE_DIR:-/mnt/c/Scimark}:/workspace:ro
     ports:

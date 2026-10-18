@@ -21,6 +21,11 @@ async def main() -> None:
             print("error:" if result.isError else "ok:", result.content[0].text)
             result = await session.call_tool("ask", {"prompt": "Сколько будет 17*23? Ответь одним числом."})
             print("ask error:" if result.isError else "ask:", result.content[0].text)
+            result = await session.call_tool("summarize_files", {
+                "paths": [r"C:\Scimark\SciMarkEnv\docker-compose.yml", r"C:\Scimark\SciMarkEnv\llm-mcp\*.py"],
+                "question": "Какие тут реальные баги или риски безопасности? Максимум 5 пунктов, по одной строке.",
+            })
+            print("summarize error:" if result.isError else "summarize:", result.content[0].text)
 
 
 asyncio.run(main())
