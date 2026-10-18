@@ -29,6 +29,9 @@
 Тулы:
 - `ask`, `summarize_files` - синхронно, ждут ответ (Claude Code);
 - `ask_async`, `summarize_files_async` + `job_result`, `list_jobs` - для клиентов с таймаутом ~60 с на вызов. Задачи живут в памяти, рестарт контейнера их теряет;
+- `jira_digest`, `jira_search_digest` (JQL), `confluence_digest` - квен сам читает Jira/Confluence (только GET, токены из `.env`) и отдаёт суть; `background=true` - вернуть job_id;
 - `llm_health` - модели, контекст, текущие настройки.
+
+Сервер stateless: клиенты не теряют подключение при пересборке контейнера.
 
 Проверка: `docker exec mcp-llm python /workspace/SciMarkEnv/llm-mcp/smoke_test.py`.

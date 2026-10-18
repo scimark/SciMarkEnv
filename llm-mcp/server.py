@@ -10,6 +10,8 @@ from pathlib import Path, PureWindowsPath
 import httpx
 from mcp.server.fastmcp import FastMCP
 
+import atlassian
+
 BASE_URL = os.environ.get("LLM_BASE_URL", "").rstrip("/")
 API_KEY = os.environ.get("LLM_API_KEY", "")
 MODEL = os.environ.get("LLM_MODEL", "")
@@ -30,7 +32,8 @@ JOB_TTL = int(os.environ.get("LLM_JOB_TTL", "3600"))          # сек, скол
 MAX_PARALLEL = int(os.environ.get("LLM_MAX_PARALLEL", "4"))   # одновременных запросов к LLM
 MAX_WAIT = 50                                                 # сек, меньше таймаута клиента (60)
 
-mcp = FastMCP("llm", host="0.0.0.0", port=int(os.environ.get("MCP_PORT", "8765")))
+# stateless_http: без серверных сессий - клиенты переживают рестарт контейнера.
+mcp = FastMCP("llm", host="0.0.0.0", port=int(os.environ.get("MCP_PORT", "8765")), stateless_http=True)
 _llm_slots = asyncio.Semaphore(MAX_PARALLEL)
 
 
@@ -280,6 +283,66 @@ async def list_jobs() -> list[dict]:
         {k: v for k, v in job.view(job_id).items() if k not in ("result", "error")}
         for job_id, job in _jobs.items()
     ]
+
+
+# ---------- Jira / Confluence: квен сам читает, наружу только суть ----------
+
+DIGEST_SYSTEM = (
+    "Тебе дан материал из Jira/Confluence. Отвечай кратко и по делу, на русском. "
+    "Не выдумывай того, чего нет в материале; если чего-то нет - так и скажи. "
+    "Ключи задач, имена, версии, даты и цифры переноси точно."
+)
+DIGEST_DEFAULT_Q = (
+    "Дай суть: что нужно сделать или о чём материал, текущее состояние, "
+    "ключевые решения и договорённости из комментариев, открытые вопросы."
+)
+
+
+async def _digest(kind: str, material: str, question: str, background: bool, footer: str = ""):
+    messages = [
+        {"role": "system", "content": DIGEST_SYSTEM},
+        {"role": "user", "content": f"{material}\n\nВопрос: {question or DIGEST_DEFAULT_Q}"},
+    ]
+    if background:
+        return _submit(kind, messages, footer)
+    return await _chat(messages) + footer
+
+
+@mcp.tool()
+async def jira_digest(issue: str, question: str = "", background: bool = False):
+    """Квен сам читает задачу Jira (поля, описание, связи, все комментарии) и отдаёт суть.
+
+    issue - ключ (PROJ-123) или ссылка. question - что именно выяснить; пусто - общая выжимка.
+    background=true - сразу вернуть job_id, ответ забрать через job_result.
+    Только чтение. Создание и правка задач - не здесь.
+    """
+    return await _digest("jira_digest", await atlassian.fetch_issue(issue), question, background)
+
+
+@mcp.tool()
+async def jira_search_digest(jql: str, question: str = "", limit: int = 50, background: bool = False):
+    """Квен читает задачи по JQL (без комментариев, до 50 штук) и отвечает на вопрос по ним.
+
+    Например: jql='sprint in openSprints() AND assignee = currentUser()', question='что горит?'.
+    background=true - сразу вернуть job_id, ответ забрать через job_result.
+    """
+    text, got, total = await atlassian.search_issues(jql, limit)
+    if not got:
+        return f"По JQL ничего не найдено: {jql}"
+    footer = f"\n\n---\nзадач прочитано: {got} из {total}"
+    return await _digest("jira_search_digest", text, question, background, footer)
+
+
+@mcp.tool()
+async def confluence_digest(page: str, question: str = "", with_comments: bool = True,
+                            background: bool = False):
+    """Квен сам читает страницу Confluence (текст и комментарии) и отдаёт суть.
+
+    page - id, ссылка (?pageId=, /pages/<id>/, /display/SPACE/Title).
+    background=true - сразу вернуть job_id, ответ забрать через job_result.
+    """
+    material = await atlassian.fetch_page(page, with_comments)
+    return await _digest("confluence_digest", material, question, background)
 
 
 if __name__ == "__main__":
