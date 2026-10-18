@@ -134,6 +134,9 @@ services:
       LLM_BASE_URL: ${LLM_BASE_URL:-}
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_MODEL: ${LLM_MODEL:-}
+      LLM_THINKING: ${LLM_THINKING:-true}
+      LLM_REASONING_EFFORT: ${LLM_REASONING_EFFORT:-xhigh}
+      LLM_TIMEOUT: ${LLM_TIMEOUT:-900}
     volumes:
       - ${WORKSPACE_DIR:-/mnt/c/Scimark}:/workspace:ro
     ports:
