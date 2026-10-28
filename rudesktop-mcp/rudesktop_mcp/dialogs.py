@@ -1,4 +1,4 @@
-"""Локальные окошки на рабочем столе: пароль и подтверждения.
+"""Локальные окошки на рабочем столе: ID с паролем и подтверждения.
 
 Всё, что решает человек, спрашивается здесь, а не через MCP. Так модель не может
 сама себе ответить «да», а пароль не попадает в ответы тулз и логи.
@@ -62,32 +62,64 @@ def _show(root: tk.Tk, focus: tk.Widget) -> None:
     root.mainloop()
 
 
-def ask_password(target_id: str) -> Optional[str]:
-    """Пароль для сервера. None, если отменили."""
-    result: dict = {"value": None}
-    root = _make_root("RuDesktop: пароль")
+def normalize_id(target_id: str) -> str:
+    """ID RuDesktop без пробелов: "234 968 320" -> "234968320"."""
+    return "".join(target_id.split())
 
-    tk.Label(root, text=f"Пароль для {target_id}:").pack(padx=16, pady=(14, 4), anchor="w")
-    entry = tk.Entry(root, show="*", width=36)
-    entry.pack(padx=16, pady=4)
-    entry.bind("<Control-KeyPress>", _ctrl_shortcuts)
+
+def ask_credentials(target_id: Optional[str] = None) -> Optional[tuple[str, str]]:
+    """ID и пароль сервера. Если target_id передан, поле ID уже заполнено. None, если отменили."""
+    result: dict = {"value": None}
+    root = _make_root("RuDesktop: подключение")
+
+    form = tk.Frame(root)
+    form.pack(padx=16, pady=(14, 4))
+    tk.Label(form, text="ID RuDesktop:").grid(row=0, column=0, sticky="w", pady=4)
+    id_entry = tk.Entry(form, width=28)
+    id_entry.grid(row=0, column=1, padx=(8, 0), pady=4)
+    tk.Label(form, text="Пароль:").grid(row=1, column=0, sticky="w", pady=4)
+    pwd_entry = tk.Entry(form, show="*", width=28)
+    pwd_entry.grid(row=1, column=1, padx=(8, 0), pady=4)
+
+    for entry in (id_entry, pwd_entry):
+        entry.bind("<Control-KeyPress>", _ctrl_shortcuts)
+    if target_id:
+        id_entry.insert(0, target_id)
+
+    error = tk.Label(root, text="", fg="red")
+    error.pack(padx=16, anchor="w")
 
     def ok(_event=None):
-        result["value"] = entry.get()
+        tid = normalize_id(id_entry.get())
+        pwd = pwd_entry.get()
+        if not tid:
+            error.configure(text="Введи ID")
+            id_entry.focus_set()
+            return
+        if not pwd:
+            error.configure(text="Введи пароль")
+            pwd_entry.focus_set()
+            return
+        result["value"] = (tid, pwd)
         root.destroy()
 
     def cancel(_event=None):
         root.destroy()
 
+    def next_field(_event=None):
+        pwd_entry.focus_set()
+        return "break"
+
     buttons = tk.Frame(root)
     buttons.pack(padx=16, pady=(4, 14), anchor="e")
     tk.Button(buttons, text="Подключиться", command=ok).pack(side="left", padx=(0, 6))
     tk.Button(buttons, text="Отмена", command=cancel).pack(side="left")
+    id_entry.bind("<Return>", next_field)
     root.bind("<Return>", ok)
     root.bind("<Escape>", cancel)
     root.protocol("WM_DELETE_WINDOW", cancel)
 
-    _show(root, entry)
+    _show(root, pwd_entry if target_id else id_entry)
     return result["value"]
 
 

@@ -42,13 +42,13 @@ async def main():
         c = await call(s, "connect", target_id=TARGET, mode=MODE)
         if not c.get("connected"):
             return
-        sid = c["session_id"]
-        await call(s, "run", session_id=sid, command="hostname; whoami; Get-Date")      # read-only
-        await call(s, "run", session_id=sid, command="New-Item $env:TEMP\\rdmcp_smoke -ItemType Directory -Force | Select FullName")  # запись
-        await call(s, "run", session_id=sid, command="Start-Sleep 5; 'slept'", timeout=2)
-        await call(s, "read", session_id=sid, timeout=10)
+        sid = c["sid"]
+        await call(s, "run", sid=sid, command="hostname; whoami; Get-Date")      # read-only
+        await call(s, "run", sid=sid, command="New-Item $env:TEMP\\rdmcp_smoke -ItemType Directory -Force | Select FullName")  # запись
+        await call(s, "run", sid=sid, command="Start-Sleep 5; 'slept'", timeout=2)
+        await call(s, "read", sid=sid, timeout=10)
         await call(s, "list_sessions")
-        await call(s, "close", session_id=sid)
+        await call(s, "close", sid=sid)
 
 
 asyncio.run(main())

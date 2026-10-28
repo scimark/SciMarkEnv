@@ -20,8 +20,8 @@ mcp = FastMCP(
     "rudesktop",
     instructions=(
         "Удалённый PowerShell на серверах клиентов через RuDesktop. "
-        "connect(id) открывает сессию: пароль пользователь вводит сам в локальном окне, "
-        "его не нужно спрашивать в чате. Команды однострочные, склеивай через ';'. "
+        "connect() открывает сессию: ID и пароль пользователь вводит сам в локальном окне, "
+        "в чате их не спрашивай. Команды однострочные, склеивай через ';'. "
         "Состояние (переменные, текущая папка) живёт между run в одной сессии. "
         "Шелл на той стороне часто работает от SYSTEM, поэтому без нужды ничего не меняй. "
         "Если пользователь отклонил команду или пароль неверный, не повторяй сам, спроси его. "
@@ -89,16 +89,25 @@ async def _approve_mode(target_id: str, current: Optional[Mode], wanted: Mode) -
 
 
 @mcp.tool()
-async def connect(target_id: str, mode: Optional[Literal["confirm", "smart", "auto"]] = None) -> dict:
-    """Подключиться к серверу по ID RuDesktop и открыть удалённый PowerShell.
+async def connect(target_id: Optional[str] = None,
+                  mode: Optional[Literal["confirm", "smart", "auto"]] = None) -> dict:
+    """Подключиться к серверу через RuDesktop и открыть удалённый PowerShell.
 
-    target_id: ID RuDesktop, можно с пробелами ("234 968 320").
+    target_id: ID RuDesktop. Обычно не передавай: пользователь сам введёт ID и пароль
+               в локальном окне. Если он назвал ID в чате, передай, поле будет заполнено.
     mode: confirm - каждая команда через окошко подтверждения у пользователя;
           smart - read-only команды сами, остальное через окошко; auto - без подтверждений.
           По умолчанию RUDESKTOP_MODE (confirm). Режим выше дефолта пользователь подтверждает в окошке.
-    Пароль пользователь вводит в локальном окне, в чате его не спрашивай.
+    ID и пароль в чате не спрашивай.
     """
-    target_id = "".join(target_id.split())
+    prefill = dialogs.normalize_id(target_id) if target_id else None
+    creds = await _ui_async(dialogs.ask_credentials, prefill)
+    if creds is None:
+        audit.log("connect_cancelled", target=prefill)
+        return {"connected": False, "error": "Пользователь отменил подключение"}
+    target_id, password = creds
+    del creds
+
     wanted = Mode(mode) if mode else _default_mode()
     if not await _approve_mode(target_id, None, wanted):
         audit.log("mode_denied", target=target_id, mode=wanted.value)
@@ -109,26 +118,33 @@ async def connect(target_id: str, mode: Optional[Literal["confirm", "smart", "au
     except ExeNotFound as e:
         return {"connected": False, "error": str(e)}
 
-    def ask_password(tid: str):
-        return _ui_call(dialogs.ask_password, tid)
+    def give_password(_tid: str) -> Optional[str]:
+        # пароль отдаём один раз и сразу забываем
+        nonlocal password
+        value, password = password, None
+        return value
 
     try:
-        greeting = await asyncio.to_thread(session.connect, ask_password)
+        greeting = await asyncio.to_thread(session.connect, give_password)
     except SessionError as e:
         audit.log("connect_failed", target=target_id, error=str(e))
         return {"connected": False, "error": str(e)}
+    finally:
+        password = None
 
     _sessions[session.session_id] = {
         "session": session, "target_id": target_id, "mode": wanted,
         "opened_at": datetime.now().isoformat(timespec="seconds"),
     }
     audit.log("connect", session=session.session_id, target=target_id, mode=wanted.value)
-    return {"connected": True, "session_id": session.session_id, "target_id": target_id,
+    return {"connected": True, "sid": session.session_id, "target_id": target_id,
             "mode": wanted.value, "greeting": greeting}
 
 
+# Параметр сессии в тулзах называется sid, не session_id: мост Claude desktop
+# (remote-devices) вырезает session_id из аргументов как своё служебное поле.
 @mcp.tool()
-async def run(session_id: str, command: str, timeout: int = 60) -> dict:
+async def run(sid: str, command: str, timeout: int = 60) -> dict:
     """Выполнить однострочную PowerShell-команду в сессии.
 
     Возвращает output (stdout+stderr текстом), exit_code ($LASTEXITCODE), success ($?).
@@ -136,7 +152,7 @@ async def run(session_id: str, command: str, timeout: int = 60) -> dict:
     дочитывай через read. Новую команду до завершения старой отправить нельзя.
     denied=true значит пользователь отклонил команду: не повторяй её, спроси его.
     """
-    entry = _get(session_id)
+    entry = _get(sid)
     session: RuDesktopSession = entry["session"]
     mode: Mode = entry["mode"]
     target = entry["target_id"]
@@ -149,7 +165,7 @@ async def run(session_id: str, command: str, timeout: int = 60) -> dict:
             command,
         )
         if not approved:
-            audit.log("denied", session=session_id, target=target, mode=mode.value, command=command)
+            audit.log("denied", session=sid, target=target, mode=mode.value, command=command)
             return {"denied": True, "message": "Пользователь отклонил команду"}
         decision = "approved"
     else:
@@ -159,40 +175,40 @@ async def run(session_id: str, command: str, timeout: int = 60) -> dict:
         result = await asyncio.to_thread(session.run, command, min(max(timeout, 1), MAX_TIMEOUT))
     except SessionError as e:
         if not session.alive:
-            _sessions.pop(session_id, None)
-        audit.log("run_failed", session=session_id, target=target, command=command, error=str(e))
+            _sessions.pop(sid, None)
+        audit.log("run_failed", session=sid, target=target, command=command, error=str(e))
         return {"error": str(e), "session_alive": session.alive}
 
-    audit.log("run", session=session_id, target=target, mode=mode.value, decision=decision,
+    audit.log("run", session=sid, target=target, mode=mode.value, decision=decision,
               command=command, exit_code=result.get("exit_code"), done=result.get("done"))
     result["output"] = _trim(result["output"])
     return result
 
 
 @mcp.tool()
-async def read(session_id: str, timeout: int = 30) -> dict:
+async def read(sid: str, timeout: int = 30) -> dict:
     """Дочитать результат команды, которая вернула done=false."""
-    session: RuDesktopSession = _get(session_id)["session"]
+    session: RuDesktopSession = _get(sid)["session"]
     try:
         result = await asyncio.to_thread(session.read, min(max(timeout, 1), MAX_TIMEOUT))
     except SessionError as e:
         if not session.alive:
-            _sessions.pop(session_id, None)
+            _sessions.pop(sid, None)
         return {"error": str(e), "session_alive": session.alive}
     result["output"] = _trim(result["output"])
     return result
 
 
 @mcp.tool()
-async def set_mode(session_id: str, mode: Literal["confirm", "smart", "auto"]) -> dict:
+async def set_mode(sid: str, mode: Literal["confirm", "smart", "auto"]) -> dict:
     """Сменить режим подтверждений. Повышение пользователь подтверждает в окошке."""
-    entry = _get(session_id)
+    entry = _get(sid)
     wanted = Mode(mode)
     if not await _approve_mode(entry["target_id"], entry["mode"], wanted):
-        audit.log("mode_denied", session=session_id, target=entry["target_id"], mode=wanted.value)
+        audit.log("mode_denied", session=sid, target=entry["target_id"], mode=wanted.value)
         return {"changed": False, "mode": entry["mode"].value, "error": "Пользователь не разрешил"}
     entry["mode"] = wanted
-    audit.log("set_mode", session=session_id, target=entry["target_id"], mode=wanted.value)
+    audit.log("set_mode", session=sid, target=entry["target_id"], mode=wanted.value)
     return {"changed": True, "mode": wanted.value}
 
 
@@ -203,11 +219,11 @@ async def check_command(command: str) -> dict:
 
 
 @mcp.tool()
-async def close(session_id: str) -> dict:
+async def close(sid: str) -> dict:
     """Закрыть сессию."""
-    entry = _get(session_id)
-    await asyncio.to_thread(_drop, session_id)
-    audit.log("close", session=session_id, target=entry["target_id"])
+    entry = _get(sid)
+    await asyncio.to_thread(_drop, sid)
+    audit.log("close", session=sid, target=entry["target_id"])
     return {"closed": True}
 
 
@@ -215,7 +231,7 @@ async def close(session_id: str) -> dict:
 async def list_sessions() -> list[dict]:
     """Открытые сессии."""
     return [
-        {"session_id": sid, "target_id": e["target_id"], "mode": e["mode"].value,
+        {"sid": sid, "target_id": e["target_id"], "mode": e["mode"].value,
          "opened_at": e["opened_at"], "alive": e["session"].alive}
         for sid, e in _sessions.items()
     ]
