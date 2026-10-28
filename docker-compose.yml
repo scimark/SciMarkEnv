@@ -137,6 +137,8 @@ services:
       LLM_THINKING: ${LLM_THINKING:-true}
       LLM_REASONING_EFFORT: ${LLM_REASONING_EFFORT:-xhigh}
       LLM_TIMEOUT: ${LLM_TIMEOUT:-900}
+      LLM_HEARTBEAT: ${LLM_HEARTBEAT:-20}
+      LLM_SUMMARY_EFFORT: ${LLM_SUMMARY_EFFORT:-medium}
       WORKSPACE_HOST_PREFIX: ${WORKSPACE_HOST_PREFIX:-C:\Scimark}
       # Jira/Confluence для *_digest - только GET-запросы
       JIRA_URL: ${JIRA_URL:-}

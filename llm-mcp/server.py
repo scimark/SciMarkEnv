@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
 
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 import atlassian
 
@@ -32,6 +32,8 @@ MAX_FILES = int(os.environ.get("LLM_MAX_FILES", "200"))
 JOB_TTL = int(os.environ.get("LLM_JOB_TTL", "3600"))          # сек, сколько хранить готовые
 MAX_PARALLEL = int(os.environ.get("LLM_MAX_PARALLEL", "16"))  # одновременных запросов к LLM (vLLM батчит)
 MAX_WAIT = 40                                                 # сек, с запасом до таймаута клиента (60)
+# Пульс для синхронных тулов: клиент (Claude Code) рвёт вызов после ~300 с без progress.
+HEARTBEAT = int(os.environ.get("LLM_HEARTBEAT", "20"))      # сек между progress-нотификациями
 
 # stateless_http: без серверных сессий - клиенты переживают рестарт контейнера.
 mcp = FastMCP("llm", host="0.0.0.0", port=int(os.environ.get("MCP_PORT", "8765")), stateless_http=True)
@@ -52,6 +54,7 @@ def _client() -> httpx.AsyncClient:
 
 EFFORTS = ("low", "medium", "xhigh")
 CODE_EFFORT = os.environ.get("LLM_CODE_EFFORT", "medium")  # xhigh на коде думает по 10+ минут
+SUMMARY_EFFORT = os.environ.get("LLM_SUMMARY_EFFORT", "medium")  # на выжимках xhigh только жжёт время
 
 
 async def _chat(messages: list[dict], effort: str | None = None) -> str:
@@ -89,6 +92,30 @@ async def _chat(messages: list[dict], effort: str | None = None) -> str:
                     if piece:
                         parts.append(piece)
     return "".join(parts).strip()
+
+
+async def _chat_live(ctx: Context | None, messages: list[dict], effort: str | None = None) -> str:
+    """_chat для синхронных тулов: пока модель думает, шлём progress раз в HEARTBEAT секунд.
+
+    Без этого клиент видит тишину и рвёт вызов по своему таймауту (~300 с у Claude Code).
+    Если клиент отвалился - задача к LLM отменяется и слот семафора освобождается.
+    """
+    task = asyncio.create_task(_chat(messages, effort))
+    started = time.monotonic()
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=HEARTBEAT)
+            if done:
+                return task.result()
+            if ctx is not None:
+                elapsed = int(time.monotonic() - started)
+                try:
+                    await ctx.report_progress(elapsed, None, f"модель думает: {elapsed} с")
+                except Exception:  # пульс - best effort, ответ важнее
+                    pass
+    finally:
+        if not task.done():
+            task.cancel()
 
 
 # ---------- Файлы ----------
@@ -248,27 +275,31 @@ async def llm_health() -> dict:
 
 
 @mcp.tool()
-async def ask(prompt: str, system: str | None = None, effort: str | None = None) -> str:
+async def ask(prompt: str, system: str | None = None, effort: str | None = None,
+              ctx: Context | None = None) -> str:
     """Отдать задачу командному LLM (Qwen) и дождаться итогового ответа.
 
     Подходит для шаблонного кода, маппингов, DTO, тест-кейсов, выжимок.
     Ответ модели нужно проверять: это 27B-модель, а не замена ревью.
-    Думает долго (до минут). Если у клиента таймаут на тул ~60 с - используй ask_async.
+    Думает долго (до минут), пока думает - шлёт progress, чтобы вызов не рвался по тишине.
+    Если у клиента жёсткий таймаут на тул ~60 с - используй ask_async.
     effort - low | medium | xhigh (по умолчанию xhigh).
     """
-    return await _chat(_ask_messages(prompt, system), effort)
+    return await _chat_live(ctx, _ask_messages(prompt, system), effort)
 
 
 @mcp.tool()
-async def summarize_files(paths: list[str], question: str) -> str:
+async def summarize_files(paths: list[str], question: str, effort: str | None = None,
+                          ctx: Context | None = None) -> str:
     """Командный LLM сам читает файлы с диска пользователя и отвечает на вопрос по ним.
 
     paths - пути или глобы в C:\\Scimark (например C:\\Scimark\\logs\\**\\*.log).
     Файлы не проходят через контекст вызывающего - возвращается только ответ.
-    Думает долго. Если у клиента таймаут на тул ~60 с - используй summarize_files_async.
+    Пока думает - шлёт progress. Если у клиента жёсткий таймаут на тул ~60 с - summarize_files_async.
+    effort - low | medium | xhigh, по умолчанию medium.
     """
     messages, footer = _prepare_summarize(paths, question)
-    return await _chat(messages) + footer
+    return await _chat_live(ctx, messages, effort or SUMMARY_EFFORT) + footer
 
 
 @mcp.tool()
@@ -278,13 +309,13 @@ async def ask_async(prompt: str, system: str | None = None, effort: str | None =
 
 
 @mcp.tool()
-async def summarize_files_async(paths: list[str], question: str) -> dict:
+async def summarize_files_async(paths: list[str], question: str, effort: str | None = None) -> dict:
     """То же, что summarize_files, но сразу возвращает job_id. Ответ забирать через job_result.
 
     Ошибки путей (нет файлов, путь вне C:\\Scimark) возвращаются сразу.
     """
     messages, footer = _prepare_summarize(paths, question)
-    return _submit("summarize_files", messages, footer)
+    return _submit("summarize_files", messages, footer, effort or SUMMARY_EFFORT)
 
 
 @mcp.tool()
@@ -327,7 +358,7 @@ CODE_SYSTEM = (
 
 @mcp.tool()
 async def write_code(task: str, context_paths: list[str] | None = None, background: bool = False,
-                     effort: str | None = None):
+                     effort: str | None = None, ctx: Context | None = None):
     """Квен пишет код по ТЗ. Сам читает файлы проекта из context_paths (образцы стиля, интерфейсы,
     файл, который надо переделать) - их содержимое не проходит через контекст вызывающего.
 
@@ -348,7 +379,7 @@ async def write_code(task: str, context_paths: list[str] | None = None, backgrou
     ]
     if background:
         return _submit("write_code", messages, footer, effort)
-    return await _chat(messages, effort) + footer
+    return await _chat_live(ctx, messages, effort) + footer
 
 
 # ---------- Jira / Confluence: квен сам читает, наружу только суть ----------
@@ -364,29 +395,32 @@ DIGEST_DEFAULT_Q = (
 )
 
 
-async def _digest(kind: str, material: str, question: str, background: bool, footer: str = ""):
+async def _digest(kind: str, material: str, question: str, background: bool, footer: str = "",
+                  ctx: Context | None = None):
     messages = [
         {"role": "system", "content": DIGEST_SYSTEM},
         {"role": "user", "content": f"{material}\n\nВопрос: {question or DIGEST_DEFAULT_Q}"},
     ]
     if background:
         return _submit(kind, messages, footer)
-    return await _chat(messages) + footer
+    return await _chat_live(ctx, messages) + footer
 
 
 @mcp.tool()
-async def jira_digest(issue: str, question: str = "", background: bool = False):
+async def jira_digest(issue: str, question: str = "", background: bool = False,
+                      ctx: Context | None = None):
     """Квен сам читает задачу Jira (поля, описание, связи, все комментарии) и отдаёт суть.
 
     issue - ключ (PROJ-123) или ссылка. question - что именно выяснить; пусто - общая выжимка.
     background=true - сразу вернуть job_id, ответ забрать через job_result.
     Только чтение. Создание и правка задач - не здесь.
     """
-    return await _digest("jira_digest", await atlassian.fetch_issue(issue), question, background)
+    return await _digest("jira_digest", await atlassian.fetch_issue(issue), question, background, ctx=ctx)
 
 
 @mcp.tool()
-async def jira_search_digest(jql: str, question: str = "", limit: int = 50, background: bool = False):
+async def jira_search_digest(jql: str, question: str = "", limit: int = 50, background: bool = False,
+                             ctx: Context | None = None):
     """Квен читает задачи по JQL (без комментариев, до 50 штук) и отвечает на вопрос по ним.
 
     Например: jql='sprint in openSprints() AND assignee = currentUser()', question='что горит?'.
@@ -396,19 +430,19 @@ async def jira_search_digest(jql: str, question: str = "", limit: int = 50, back
     if not got:
         return f"По JQL ничего не найдено: {jql}"
     footer = f"\n\n---\nзадач прочитано: {got} из {total}"
-    return await _digest("jira_search_digest", text, question, background, footer)
+    return await _digest("jira_search_digest", text, question, background, footer, ctx)
 
 
 @mcp.tool()
 async def confluence_digest(page: str, question: str = "", with_comments: bool = True,
-                            background: bool = False):
+                            background: bool = False, ctx: Context | None = None):
     """Квен сам читает страницу Confluence (текст и комментарии) и отдаёт суть.
 
     page - id, ссылка (?pageId=, /pages/<id>/, /display/SPACE/Title).
     background=true - сразу вернуть job_id, ответ забрать через job_result.
     """
     material = await atlassian.fetch_page(page, with_comments)
-    return await _digest("confluence_digest", material, question, background)
+    return await _digest("confluence_digest", material, question, background, ctx=ctx)
 
 
 if __name__ == "__main__":
